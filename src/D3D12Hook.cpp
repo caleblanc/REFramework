@@ -21,6 +21,62 @@
 static D3D12Hook* g_d3d12_hook = nullptr;
 thread_local bool g_inside_d3d12_hook = false;
 
+static bool is_running_under_wine() {
+    static bool checked = false;
+    static bool result = false;
+    if (!checked) {
+        auto ntdll = GetModuleHandleA("ntdll.dll");
+        result = ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+        if (result) spdlog::info("[CrossOver] Wine/CrossOver detected - enabling compatibility mode");
+        checked = true;
+    }
+    return result;
+}
+
+// Populate s_swapchain_vtable and s_command_queue_offset from a live swap chain + command queue.
+// Called from both the Streamline callback and the CreateSwapChain hook so we don't need
+// a headless D3D12 device to discover these at all.
+void D3D12Hook::crossover_extract_swapchain_info(void* swapchain_ptr, void* cmdqueue_ptr) {
+    if (swapchain_ptr == nullptr || IsBadReadPtr(swapchain_ptr, sizeof(void*))) return;
+
+    auto vtbl = *(void**)swapchain_ptr;
+    if (vtbl == nullptr || IsBadReadPtr(vtbl, sizeof(void*) * 20)) return;
+
+    D3D12Hook::s_swapchain_vtable = (void**)vtbl;
+    spdlog::info("[CrossOver] Swapchain vtable: {:x}", (uintptr_t)vtbl);
+
+    // Direct one-level scan for command queue pointer inside swapchain object
+    for (auto i = 0u; i < 512 * sizeof(void*); i += sizeof(void*)) {
+        const auto base = (uintptr_t)swapchain_ptr + i;
+        if (IsBadReadPtr((void*)base, sizeof(void*))) break;
+        if (*(void**)base == cmdqueue_ptr) {
+            D3D12Hook::s_command_queue_offset = i;
+            spdlog::info("[CrossOver] cmd queue offset (direct): {:x}", i);
+            return;
+        }
+    }
+
+    // Two-level scan (Proton/Streamline-wrapped swapchain)
+    for (auto base = 0u; base < 512 * sizeof(void*); base += sizeof(void*)) {
+        const auto pre = (uintptr_t)swapchain_ptr + base;
+        if (IsBadReadPtr((void*)pre, sizeof(void*))) break;
+        const auto inner = *(uintptr_t*)pre;
+        if (inner == 0 || IsBadReadPtr((void*)inner, sizeof(void*))) continue;
+        for (auto i = 0u; i < 512 * sizeof(void*); i += sizeof(void*)) {
+            const auto slot = inner + i;
+            if (IsBadReadPtr((void*)slot, sizeof(void*))) break;
+            if (*(void**)slot == cmdqueue_ptr) {
+                D3D12Hook::s_command_queue_offset = i;
+                D3D12Hook::s_proton_swapchain_offset = base;
+                spdlog::info("[CrossOver] cmd queue offset (two-level): {:x}, swapchain offset: {:x}", i, base);
+                return;
+            }
+        }
+    }
+
+    spdlog::warn("[CrossOver] Could not find command queue offset - Present hook may not work");
+}
+
 D3D12Hook::~D3D12Hook() {
     unhook();
 }
@@ -50,6 +106,17 @@ void* D3D12Hook::Streamline::link_swapchain_to_cmd_queue(void* rcx, void* rdx, v
 
     auto& hook = D3D12Hook::s_streamline.link_swapchain_to_cmd_queue_hook;
     const auto result = hook->get_original<decltype(link_swapchain_to_cmd_queue)>()(rcx, rdx, r8, r9);
+
+    // CrossOver: populate vtable info from Streamline args before attempting hook_d3d12().
+    // linkSwapchainToCmdQueue(swapchain, cmdqueue, ...) - try rcx=swapchain, rdx=cmdqueue
+    // and also rdx=swapchain, r8=cmdqueue as fallback.
+    if (is_running_under_wine() && D3D12Hook::s_swapchain_vtable == nullptr) {
+        spdlog::info("[CrossOver] Attempting vtable extraction from Streamline args");
+        crossover_extract_swapchain_info(rcx, rdx);
+        if (D3D12Hook::s_swapchain_vtable == nullptr) {
+            crossover_extract_swapchain_info(rdx, r8);
+        }
+    }
 
     // Re-hooks present after the above function creates the swapchain
     // This allows the hook to immediately still function
@@ -85,6 +152,13 @@ HRESULT WINAPI D3D12Hook::create_swapchain(IDXGIFactory4* factory, IUnknown* dev
     }
 
     const auto result = create_swap_chain_fn(factory, device, hwnd, desc, p_fullscreen_desc, p_restrict_to_output, swap_chain);
+
+    // CrossOver: extract vtable info from the real swapchain before retrying hook_d3d12().
+    // In D3D12 mode 'device' is actually the ID3D12CommandQueue (per D3D12 DXGI contract).
+    if (is_running_under_wine() && swap_chain != nullptr && *swap_chain != nullptr && s_swapchain_vtable == nullptr) {
+        spdlog::info("[CrossOver] Extracting vtable info from CreateSwapChain result");
+        crossover_extract_swapchain_info((void*)*swap_chain, (void*)device);
+    }
 
     // rather than waiting on the hook monitor to notice the hook isn't working
     if (!hook_was_nullptr) {
@@ -170,6 +244,51 @@ bool D3D12Hook::hook() {
             m_hooked = false;
         }
 
+        return m_hooked;
+    }
+
+    // CrossOver/Wine: we cannot create a headless D3D12 device (Metal requires a drawable).
+    // Instead hook CreateSwapChainForHwnd on the DXGI factory so we intercept the game's
+    // real swap chain creation, extract vtable/cmdqueue info there, then fall through to
+    // the fast-path reinitialization on the next hook() call.
+    if (is_running_under_wine()) {
+        spdlog::info("[CrossOver] Skipping headless D3D12 device creation");
+
+        const auto dxgi_module = LoadLibraryA("dxgi.dll");
+        if (dxgi_module == nullptr) {
+            spdlog::error("[CrossOver] Failed to load dxgi.dll");
+            return false;
+        }
+
+        auto create_dxgi_factory = (decltype(CreateDXGIFactory)*)GetProcAddress(dxgi_module, "CreateDXGIFactory");
+        if (create_dxgi_factory == nullptr) {
+            spdlog::error("[CrossOver] Failed to get CreateDXGIFactory");
+            return false;
+        }
+
+        IDXGIFactory4* factory{ nullptr };
+        if (FAILED(create_dxgi_factory(IID_PPV_ARGS(&factory)))) {
+            spdlog::error("[CrossOver] Failed to create DXGI factory");
+            return false;
+        }
+
+        s_factory_vtable = *(void***)factory;
+        spdlog::info("[CrossOver] Got factory vtable: {:x}", (uintptr_t)s_factory_vtable);
+
+        hook_streamline();
+
+        if (s_create_swapchain_hook == nullptr) {
+            auto& create_swapchain_fn = s_factory_vtable[15]; // CreateSwapChainForHwnd
+            s_create_swapchain_hook = std::make_unique<PointerHook>(&create_swapchain_fn, &D3D12Hook::create_swapchain);
+            spdlog::info("[CrossOver] Hooked CreateSwapChainForHwnd, waiting for game swapchain");
+        }
+
+        factory->Release();
+
+        // Partially hooked - create_swapchain or Streamline callback will populate
+        // s_swapchain_vtable / s_command_queue_offset and then call hook_d3d12() again,
+        // which re-enters hook() and takes the fast path at the top of this function.
+        m_hooked = true;
         return m_hooked;
     }
 

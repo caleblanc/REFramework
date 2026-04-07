@@ -99,6 +99,7 @@ public:
     }
 
     static void hook_streamline(HMODULE dlssg_module = nullptr);
+    static void crossover_extract_swapchain_info(void* swapchain_ptr, void* cmdqueue_ptr);
 
 protected:
     void hook_impl();
