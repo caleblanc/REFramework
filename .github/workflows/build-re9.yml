@@ -28,11 +28,17 @@ jobs:
       - name: Build RE9
         run: cmake --build build --config Release --target RE9
 
-      - name: Rename to dinput8.dll
+      - name: Find and copy DLL
         run: |
+          Write-Output "--- All DLLs in build ---"
+          Get-ChildItem -Recurse build -Filter "*.dll" | ForEach-Object { Write-Output $_.FullName }
           $src = Get-ChildItem -Recurse build -Filter "RE9.dll" | Select-Object -First 1
-          Write-Output "Found: $($src.FullName)"
-          Copy-Item $src.FullName -Destination build/dinput8.dll
+          if ($null -ne $src) {
+            Write-Output "Found: $($src.FullName)"
+            Copy-Item $src.FullName -Destination build/dinput8.dll
+          } else {
+            throw "RE9.dll not found in build output"
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
