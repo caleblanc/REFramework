@@ -1,0 +1,42 @@
+name: Build RE9 (CrossOver Patch)
+
+on:
+  push:
+    branches: [crossover-patch]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DREF_BUILD_RE9_SDK=ON `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build RE9
+        run: cmake --build build --config Release --target RE9
+
+      - name: Rename to dinput8.dll
+        run: |
+          $src = Get-ChildItem -Recurse build -Filter "RE9.dll" | Select-Object -First 1
+          Write-Output "Found: $($src.FullName)"
+          Copy-Item $src.FullName -Destination build/dinput8.dll
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dinput8-crossover
+          path: build/dinput8.dll
+          retention-days: 30
